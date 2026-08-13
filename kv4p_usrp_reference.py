@@ -18,14 +18,12 @@ import sys
 import time
 import wave
 from dataclasses import dataclass
-from typing import BinaryIO
 
 import numpy as np
 import serial
 from scipy.signal import firwin, lfilter
 
 AUDIO_RATE = 48_000
-USRP_RATE = 8_000
 OPUS_SAMPLES = 1_920  # 40 ms at 48 kHz
 USRP_SAMPLES = 160  # 20 ms at 8 kHz
 PROTO_MTU = 2_048
