@@ -46,6 +46,11 @@ the bridge host; the bridge host must accept UDP 34001 from AllStar.
 
 ## Run
 
+The operator must explicitly provide both RX and TX frequencies in MHz. The
+bridge never trusts frequencies persisted by a previous KV4P session. Confirm
+that both frequencies are authorized for your station and appropriate for the
+intended simplex or repeater channel.
+
 When AllStar runs on the same host, `--allstar-host` may be omitted and
 defaults to `127.0.0.1`. Start safely in receive-only mode first:
 
@@ -53,6 +58,8 @@ defaults to `127.0.0.1`. Start safely in receive-only mode first:
 ./kv4p_usrp.py \
   --device /dev/ttyUSB1 \
   --allstar-host 192.168.3.9 \
+  --rx-frequency <RX_MHZ> \
+  --tx-frequency <TX_MHZ> \
   --squelch 4 \
   --receive-only
 ```
@@ -64,12 +71,16 @@ RF transmission:
 ./kv4p_usrp.py \
   --device /dev/ttyUSB1 \
   --allstar-host 192.168.3.9 \
+  --rx-frequency <RX_MHZ> \
+  --tx-frequency <TX_MHZ> \
   --squelch 4
 ```
 
-Use `--rx-frequency` and `--tx-frequency` (MHz) to override the frequencies
-stored by the KV4P. Use a persistent `/dev/serial/by-id/...` or udev-created
-device name in production.
+The bridge rejects frequencies outside the RF module range reported in its
+KV4P HELLO message. This hardware-range check does not determine whether a
+frequency is legal for the operator, country, licence class, or local band
+plan. Use a persistent `/dev/serial/by-id/...` or udev-created device name in
+production.
 
 ## Safety
 
