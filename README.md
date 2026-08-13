@@ -4,16 +4,14 @@ Bridge a [KV4P-HT](https://github.com/VanceVagell/kv4p-ht) radio to an
 [AllStarLink](https://www.allstarlink.org/) node using AllStar's USRP UDP
 channel driver.
 
-The repository currently contains the proven Python reference implementation.
-It supports bidirectional audio, PTT, COS/squelch, Opus conversion, and the
-fixed 48 kHz ↔ 8 kHz resampling required between KV4P and USRP. A lightweight C
-daemon is planned; the Python implementation serves as executable protocol
-documentation and a known-working baseline.
+The Python bridge is the production implementation. It supports bidirectional
+audio, PTT, COS/squelch, Opus conversion, and the fixed 48 kHz ↔ 8 kHz
+resampling required between KV4P and USRP.
 
 ## Signal path
 
 ```text
-RF ↔ SA818 ↔ ESP32/KV4P ↔ USB serial ↔ kv4p_usrp_reference.py
+RF ↔ SA818 ↔ ESP32/KV4P ↔ USB serial ↔ kv4p_usrp.py
    ↔ USRP/UDP ↔ chan_usrp ↔ AllStarLink
 ```
 
@@ -48,10 +46,11 @@ the bridge host; the bridge host must accept UDP 34001 from AllStar.
 
 ## Run
 
-Start safely in receive-only mode first:
+When AllStar runs on the same host, `--allstar-host` may be omitted and
+defaults to `127.0.0.1`. Start safely in receive-only mode first:
 
 ```bash
-./kv4p_usrp_reference.py \
+./kv4p_usrp.py \
   --device /dev/ttyUSB1 \
   --allstar-host 192.168.3.9 \
   --squelch 4 \
@@ -62,7 +61,7 @@ After verifying RF → AllStar audio, omit `--receive-only` to permit AllStar �
 RF transmission:
 
 ```bash
-./kv4p_usrp_reference.py \
+./kv4p_usrp.py \
   --device /dev/ttyUSB1 \
   --allstar-host 192.168.3.9 \
   --squelch 4
@@ -108,10 +107,10 @@ USRP keying.
 ## Project status
 
 The Python bridge has been tested bidirectionally against AllStarLink node
-69449. It is a reference implementation rather than a packaged production
-service. Planned work includes the C implementation, deterministic 20 ms
-pacing, stronger reconnect handling, configuration files, systemd packaging,
-and automated protocol/resampler tests.
+69449 with clean audio and normal AllStar courtesy-tone behavior. Potential
+future work includes reconnect hardening, configuration files, systemd
+packaging, automated protocol/resampler tests, and—only if resource usage
+warrants it—an optional lightweight C implementation.
 
 ## License
 
