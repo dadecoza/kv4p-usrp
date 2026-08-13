@@ -271,8 +271,8 @@ class Bridge:
         self.sequence += 1
         payload = DESIRED.pack(
             self.sequence, self.state.memory_id, self.desired_flags(ptt),
-            self.state.bandwidth, self.args.tx_frequency or self.state.tx_frequency,
-            self.args.rx_frequency or self.state.rx_frequency,
+            self.state.bandwidth, self.args.tx_frequency,
+            self.args.rx_frequency,
             self.state.tx_ctcss, self.args.squelch, self.state.rx_ctcss,
         )
         self.send_vendor(CMD_HOST_DESIRED_STATE, payload)
@@ -300,6 +300,15 @@ class Bridge:
         self.window = window
         self.state = DeviceState.decode(payload[VERSION.size:])
         self.sequence = self.state.sequence
+        for label, frequency in (
+            ("RX", self.args.rx_frequency),
+            ("TX", self.args.tx_frequency),
+        ):
+            if not minimum <= frequency <= maximum:
+                raise RuntimeError(
+                    f"{label} frequency {frequency:.4f} MHz is outside the "
+                    f"radio module range {minimum:.1f}-{maximum:.1f} MHz"
+                )
         print(
             f"HELLO firmware={firmware} radio={status.decode(errors='replace')} "
             f"module={'VHF' if module == 0 else 'UHF'} range={minimum:.1f}-{maximum:.1f} "
@@ -454,8 +463,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--usrp-bind", default="0.0.0.0")
     parser.add_argument("--usrp-local-port", type=int, default=34_001)
     parser.add_argument("--squelch", type=int, choices=range(0, 9), default=4)
-    parser.add_argument("--rx-frequency", type=float, help="MHz; default preserves KV4P state")
-    parser.add_argument("--tx-frequency", type=float, help="MHz; default preserves KV4P state")
+    parser.add_argument(
+        "--rx-frequency", type=float, required=True,
+        help="receive frequency in MHz (required)",
+    )
+    parser.add_argument(
+        "--tx-frequency", type=float, required=True,
+        help="transmit frequency in MHz (required)",
+    )
     parser.add_argument("--tx-timeout", type=float, default=0.5)
     parser.add_argument("--receive-only", action="store_true", help="never key the transmitter")
     parser.add_argument("--record", metavar="WAV", help="optionally record decoded 48 kHz RX")
