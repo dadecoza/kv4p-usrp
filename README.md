@@ -54,15 +54,16 @@ udev rule based on their physical `ID_PATH` or specify the correct
 
 ## AllStar configuration
 
-If the bridge host is `192.168.3.67`, configure the node in
-`/etc/asterisk/rpt.conf`:
+For the usual setup where the bridge runs directly on the AllStar Pi,
+configure the node in `/etc/asterisk/rpt.conf`:
 
 ```ini
-rxchannel = USRP/192.168.3.67:34001:32001
+rxchannel = USRP/127.0.0.1:34001:32001
 ```
 
-Ensure `chan_usrp.so` is loaded. The AllStar host must accept UDP 32001 from
-the bridge host; the bridge host must accept UDP 34001 from AllStar.
+Ensure `chan_usrp.so` is loaded. If the bridge runs on a separate host,
+replace `127.0.0.1` with that host's address, pass the AllStar host address
+using `--allstar-host`, and permit UDP 32001/34001 between the two systems.
 
 ## Run
 
@@ -77,7 +78,6 @@ defaults to `127.0.0.1`. Start safely in receive-only mode first:
 ```bash
 ./kv4p_usrp.py \
   --device /dev/ttyUSB1 \
-  --allstar-host 192.168.3.9 \
   --rx-frequency <RX_MHZ> \
   --tx-frequency <TX_MHZ> \
   --squelch 4 \
@@ -90,7 +90,6 @@ RF transmission:
 ```bash
 ./kv4p_usrp.py \
   --device /dev/ttyUSB1 \
-  --allstar-host 192.168.3.9 \
   --rx-frequency <RX_MHZ> \
   --tx-frequency <TX_MHZ> \
   --squelch 4
@@ -145,4 +144,4 @@ warrants it—an optional lightweight C implementation.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
