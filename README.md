@@ -32,6 +32,26 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
+Grant the user running the bridge access to USB serial devices:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+Log out completely and log back in for the new group membership to take
+effect. Then verify both membership and access:
+
+```bash
+id
+ls -l /dev/serial/by-id/
+test -r /dev/ttyUSB1 && test -w /dev/ttyUSB1 && echo "Serial access OK"
+```
+
+Use the stable `/dev/serial/by-id/...` path when the adapter has a unique
+serial number. If multiple CP2102 adapters expose the same identity, use a
+udev rule based on their physical `ID_PATH` or specify the correct
+`/dev/ttyUSB*` device explicitly.
+
 ## AllStar configuration
 
 If the bridge host is `192.168.3.67`, configure the node in
