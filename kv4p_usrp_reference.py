@@ -374,6 +374,11 @@ class Bridge:
             self.last_usrp_packet = time.monotonic()
             audio = packet[USRP_HEADER.size:]
             if keyup:
+                # The radio is half duplex. RF has priority once COS opens.
+                # In particular, do not let audio routed back by AllStar seize
+                # PTT and terminate the receive stream we are forwarding.
+                if self.cos_active and not self.device_tx_active:
+                    continue
                 if not self.allstar_keyed:
                     self.allstar_keyed = True
                     self.tx_pcm.clear()
