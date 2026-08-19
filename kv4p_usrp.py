@@ -201,6 +201,7 @@ class Bridge:
         self.sequence = 0
         self.device_tx_active = False
         self.ptt_requested = False
+        self.ptt_release_deadline: float | None = None
         self.allstar_keyed = False
         self.last_usrp_packet: float | None = None
         self.cos_active = False
@@ -377,29 +378,44 @@ class Bridge:
                 packet, address = self.udp.recvfrom(2_048)
             except BlockingIOError:
                 return
+
             if address[0] != self.args.allstar_host or len(packet) < USRP_HEADER.size:
                 continue
+
             eye, _, _, keyup, _, kind, _, _ = USRP_HEADER.unpack_from(packet)
+
             if eye != b"USRP" or kind != 0:
                 continue
+
             self.stats["usrp_rx"] += 1
             self.last_usrp_packet = time.monotonic()
+
             audio = packet[USRP_HEADER.size:]
+
             if keyup:
                 # The radio is half duplex. RF has priority once COS opens.
-                # In particular, do not let audio routed back by AllStar seize
-                # PTT and terminate the receive stream we are forwarding.
                 if self.cos_active and not self.device_tx_active:
                     continue
+
                 if not self.allstar_keyed:
                     self.allstar_keyed = True
+                    self.ptt_release_deadline = None
                     self.tx_pcm.clear()
                     print("AllStar requested TX")
                     self.request_state(True)
+
+                # We have received a real TX audio packet, so keep PTT alive.
+                self.ptt_release_deadline = None
+
                 if len(audio) == USRP_SAMPLES * 2:
                     self.tx_pcm.extend(audio)
+
             elif self.allstar_keyed:
-                self.unkey("AllStar released TX")
+                # No TX audio/keying packet. Start the PTT hang timer,
+                # but don't immediately release the KV4P.
+                self.ptt_release_deadline = (
+                    time.monotonic() + self.args.ptt_hang
+                )
 
     def pump_tx(self) -> None:
         if not self.device_tx_active:
@@ -436,6 +452,13 @@ class Bridge:
                 and time.monotonic() - self.last_usrp_packet > self.args.tx_timeout
             ):
                 self.unkey("USRP timeout; forcing PTT off")
+
+            if (
+                self.allstar_keyed
+                and self.ptt_release_deadline is not None
+                and time.monotonic() >= self.ptt_release_deadline
+            ):
+                self.unkey("AllStar released TX")
 
     def stop(self, *_args) -> None:
         self.running = False
@@ -476,7 +499,7 @@ def parse_args() -> argparse.Namespace:
         "--tx-frequency", type=float, required=True,
         help="transmit frequency in MHz (required)",
     )
-    parser.add_argument("--tx-timeout", type=float, default=0.5)
+    parser.add_argument("--tx-timeout", type=float, default=1)
     parser.add_argument("--receive-only", action="store_true", help="never key the transmitter")
     parser.add_argument("--record", metavar="WAV", help="optionally record decoded 48 kHz RX")
     parser.add_argument("--no-reset", action="store_true", help="do not pulse CP2102 RTS")
@@ -485,6 +508,12 @@ def parse_args() -> argparse.Namespace:
         choices=("high", "low"),
         default="high",
         help="KV4P transmit power: high or low (default: high)",
+    )
+    parser.add_argument(
+        "--ptt-hang",
+        type=float,
+        default=0.40,
+        help="delay before releasing KV4P PTT after AllStar key-up (seconds)",
     )
     return parser.parse_args()
 
