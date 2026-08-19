@@ -45,6 +45,7 @@ HOST_ENABLE_STATUS_REPORTS = 1 << 12
 DEVICE_PHYS_PTT_DOWN = 1 << 8
 DEVICE_TX_ACTIVE = 1 << 9
 DEVICE_SQUELCHED = 1 << 10
+HOST_HIGH_POWER = 1 << 3
 
 VERSION = struct.Struct("<HcIBffB")
 STATE = struct.Struct("<IiHBffBBBcBBB")
@@ -257,12 +258,16 @@ class Bridge:
 
     def desired_flags(self, ptt: bool) -> int:
         flags = HOST_RADIO_CONFIG_VALID | HOST_RX_AUDIO_OPEN | HOST_ENABLE_STATUS_REPORTS
+
+        if self.args.power == "high":
+            flags |= HOST_HIGH_POWER
+
         if not self.args.receive_only:
             flags |= HOST_TX_ALLOWED
+
         if ptt:
             flags |= HOST_PTT_REQUESTED
-        # RSSI is intentionally never enabled: polling causes audible ticks on
-        # v1.x hardware due to serial/audio trace crosstalk.
+
         return flags
 
     def request_state(self, ptt: bool) -> None:
@@ -475,6 +480,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--receive-only", action="store_true", help="never key the transmitter")
     parser.add_argument("--record", metavar="WAV", help="optionally record decoded 48 kHz RX")
     parser.add_argument("--no-reset", action="store_true", help="do not pulse CP2102 RTS")
+    parser.add_argument(
+        "--power",
+        choices=("high", "low"),
+        default="high",
+        help="KV4P transmit power: high or low (default: high)",
+    )
     return parser.parse_args()
 
 
