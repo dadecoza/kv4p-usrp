@@ -410,9 +410,10 @@ class Bridge:
                 if len(audio) == USRP_SAMPLES * 2:
                     self.tx_pcm.extend(audio)
 
-            elif self.allstar_keyed:
+            elif self.allstar_keyed and self.ptt_release_deadline is None:
                 # No TX audio/keying packet. Start the PTT hang timer,
-                # but don't immediately release the KV4P.
+                # but don't immediately release the KV4P. Latch the first
+                # deadline so subsequent unkeyed packets cannot extend it.
                 self.ptt_release_deadline = (
                     time.monotonic() + self.args.ptt_hang
                 )
@@ -435,6 +436,7 @@ class Bridge:
     def unkey(self, reason: str) -> None:
         print(reason)
         self.allstar_keyed = False
+        self.ptt_release_deadline = None
         self.tx_pcm.clear()
         self.tx_pending.clear()
         self.request_state(False)
