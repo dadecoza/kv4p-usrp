@@ -13,8 +13,10 @@ import signal
 import socket
 import struct
 import sys
+import threading
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,6 +26,9 @@ from scipy.signal import firwin, lfilter
 AUDIO_RATE = 48_000
 OPUS_SAMPLES = 1_920  # 40 ms at 48 kHz
 USRP_SAMPLES = 160  # 20 ms at 8 kHz
+USRP_FRAME_BYTES = USRP_SAMPLES * 2
+USRP_PERIOD = USRP_SAMPLES / 8_000
+USRP_RX_QUEUE_FRAMES = 10  # At most 200 ms of radio audio may wait for UDP.
 PROTO_MTU = 2_048
 
 FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
@@ -51,6 +56,103 @@ VERSION = struct.Struct("<HcIBffB")
 STATE = struct.Struct("<IiHBffBBBcBBB")
 DESIRED = struct.Struct("<IiHBffBBB")
 USRP_HEADER = struct.Struct("!4sIIIIIII")
+
+
+class Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+def sleep_monotonic_until(deadline: float) -> None:
+    """Sleep to an absolute CLOCK_MONOTONIC deadline."""
+    seconds = int(deadline)
+    target = Timespec(seconds, int((deadline - seconds) * 1_000_000_000))
+    libc = ctypes.CDLL(None, use_errno=True)
+    clock_nanosleep = libc.clock_nanosleep
+    clock_nanosleep.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.POINTER(Timespec), ctypes.c_void_p
+    ]
+    clock_nanosleep.restype = ctypes.c_int
+    while True:
+        result = clock_nanosleep(time.CLOCK_MONOTONIC, 1, ctypes.byref(target), None)
+        if result == 0:
+            return
+        if result != 4:  # EINTR
+            raise OSError(result, "clock_nanosleep")
+
+
+class UsrpRxPacer:
+    """Clock radio RX packets onto USRP without ever sending a catch-up burst."""
+
+    def __init__(self, send, queue_frames: int = USRP_RX_QUEUE_FRAMES) -> None:
+        self.send = send
+        self.queue = deque(maxlen=queue_frames)
+        self.condition = threading.Condition()
+        self.active = False
+        self.running = True
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._run, name="usrp-rx-pacer", daemon=True)
+        self.thread.start()
+
+    def enqueue(self, audio: bytes) -> None:
+        if len(audio) != USRP_FRAME_BYTES:
+            raise ValueError(f"expected {USRP_FRAME_BYTES} audio bytes, got {len(audio)}")
+        with self.condition:
+            if not self.active:
+                return
+            if len(self.queue) == self.queue.maxlen:
+                self.queue.popleft()
+                self.dropped += 1
+            self.queue.append(audio)
+
+    def set_active(self, active: bool) -> None:
+        with self.condition:
+            if active == self.active:
+                return
+            self.active = active
+            self.queue.clear()
+            if not active:
+                # Serialize this with keyed sends so COS cannot briefly reassert.
+                self.send(b"", False)
+            self.condition.notify_all()
+
+    def _run(self) -> None:
+        deadline: float | None = None
+        silence = bytes(USRP_FRAME_BYTES)
+        while True:
+            with self.condition:
+                while self.running and not self.active:
+                    deadline = None
+                    self.condition.wait()
+                if not self.running:
+                    return
+
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now
+            sleep_monotonic_until(deadline)
+
+            with self.condition:
+                if not self.running:
+                    return
+                if not self.active:
+                    continue
+                audio = self.queue.popleft() if self.queue else silence
+                self.send(audio, True)
+
+            # Advance from the absolute deadline. If work or the host stalled past
+            # the next slot, discard missed slots instead of bursting to catch up.
+            deadline += USRP_PERIOD
+            now = time.monotonic()
+            # A delayed wake must not compress the following interval enough to
+            # outrun chan_usrp. Ignore only normal scheduler jitter below 4 ms.
+            if deadline - now < USRP_PERIOD - 0.004:
+                deadline = now + USRP_PERIOD
+
+    def close(self) -> None:
+        with self.condition:
+            self.running = False
+            self.condition.notify_all()
+        self.thread.join(timeout=1)
 
 
 @dataclass
@@ -215,7 +317,12 @@ class Bridge:
         self.tx_filter = firwin(127, 3_400, fs=AUDIO_RATE)
         self.tx_filter_state = np.zeros(len(self.tx_filter) - 1)
         self.wav: wave.Wave_write | None = None
-        self.stats = dict(rx_opus=0, tx_opus=0, usrp_rx=0, usrp_tx=0, decode_errors=0)
+        self.stats = dict(
+            rx_opus=0, tx_opus=0, usrp_rx=0, usrp_tx=0,
+            rx_audio_dropped=0, decode_errors=0,
+        )
+        self.usrp_send_lock = threading.Lock()
+        self.rx_pacer = UsrpRxPacer(self.send_usrp)
 
     def open(self) -> None:
         if self.args.record:
@@ -324,15 +431,15 @@ class Bridge:
 
     def handle_state(self, state: DeviceState) -> None:
         old_tx = self.device_tx_active
-        old_cos = self.cos_active
         self.state = state
         self.sequence = max(self.sequence, state.sequence)
         self.device_tx_active = bool(state.flags & DEVICE_TX_ACTIVE)
         self.cos_active = not bool(state.flags & DEVICE_SQUELCHED)
         if self.device_tx_active != old_tx:
             print(f"KV4P transmitter {'active' if self.device_tx_active else 'stopped'}")
-        if self.cos_active != old_cos and not self.device_tx_active:
-            self.set_usrp_cos(self.cos_active)
+        rx_active = self.cos_active and not self.device_tx_active
+        if rx_active != self.rx_pacer.active:
+            self.set_usrp_cos(rx_active)
 
     def handle_rx_audio(self, packet: bytes) -> None:
         try:
@@ -351,25 +458,26 @@ class Bridge:
         samples_8k = np.clip(np.rint(filtered[::6]), -32768, 32767).astype("<i2")
         if self.cos_active and not self.device_tx_active:
             self.rx_pcm.extend(samples_8k.tobytes())
-            while len(self.rx_pcm) >= USRP_SAMPLES * 2:
-                audio = bytes(self.rx_pcm[: USRP_SAMPLES * 2])
-                del self.rx_pcm[: USRP_SAMPLES * 2]
-                self.send_usrp(audio, True)
+            while len(self.rx_pcm) >= USRP_FRAME_BYTES:
+                audio = bytes(self.rx_pcm[:USRP_FRAME_BYTES])
+                del self.rx_pcm[:USRP_FRAME_BYTES]
+                self.rx_pacer.enqueue(audio)
 
     def send_usrp(self, audio: bytes = b"", keyed: bool = False) -> None:
-        header = USRP_HEADER.pack(
-            b"USRP", self.usrp_sequence, 0, int(keyed), 0, 0, 0, 0
-        )
-        self.udp.sendto(header + audio, self.usrp_destination)
-        self.usrp_sequence = (self.usrp_sequence + 1) & 0xFFFFFFFF
-        self.stats["usrp_tx"] += 1
+        with self.usrp_send_lock:
+            header = USRP_HEADER.pack(
+                b"USRP", self.usrp_sequence, 0, int(keyed), 0, 0, 0, 0
+            )
+            self.udp.sendto(header + audio, self.usrp_destination)
+            self.usrp_sequence = (self.usrp_sequence + 1) & 0xFFFFFFFF
+            self.stats["usrp_tx"] += 1
 
     def set_usrp_cos(self, active: bool) -> None:
         self.rx_pcm.clear()
+        self.rx_pacer.set_active(active)
         if active:
             print("RF COS open")
         else:
-            self.send_usrp(keyed=False)
             print("RF COS closed")
 
     def receive_usrp(self) -> None:
@@ -471,6 +579,9 @@ class Bridge:
                 self.request_state(False)
                 time.sleep(0.25)
         finally:
+            self.rx_pacer.set_active(False)
+            self.rx_pacer.close()
+            self.stats["rx_audio_dropped"] = self.rx_pacer.dropped
             if self.wav:
                 self.wav.close()
             if self.ser:
