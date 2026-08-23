@@ -155,6 +155,71 @@ class UsrpRxPacer:
         self.thread.join(timeout=1)
 
 
+class PttHangController:
+    """Keep USRP intent, requested PTT, and acknowledged radio TX separate."""
+
+    def __init__(self, hang_time: float) -> None:
+        self.hang_time = hang_time
+        self.desired = False
+        self.requested = False
+        self.actual = False
+        self.generation = 0
+        self.deadline: float | None = None
+        self.deadline_generation: int | None = None
+
+    def set_desired(self, active: bool, now: float) -> tuple[bool | None, bool]:
+        """Return (new PTT request, preserve buffered audio)."""
+        if active == self.desired:
+            return None, True
+
+        self.generation += 1
+        self.desired = active
+        if active:
+            preserve_audio = self.deadline is not None
+            self.deadline = None
+            self.deadline_generation = None
+            if not self.requested or not self.actual:
+                self.requested = True
+                return True, preserve_audio
+            return None, preserve_audio
+
+        self.deadline = now + self.hang_time
+        self.deadline_generation = self.generation
+        return None, True
+
+    def expire(self, generation: int) -> bool | None:
+        """Return a PTT-off request only for the still-current OFF transition."""
+        if generation != self.generation or self.desired:
+            return None
+        if generation != self.deadline_generation:
+            return None
+        self.deadline = None
+        self.deadline_generation = None
+        if self.requested:
+            self.requested = False
+            return False
+        return None
+
+    def set_actual(self, active: bool) -> bool | None:
+        """Re-key if a late device state stops TX while USRP still wants it."""
+        was_active = self.actual
+        self.actual = active
+        if was_active and not active and self.desired:
+            self.requested = True
+            return True
+        return None
+
+    def force_off(self) -> bool | None:
+        self.generation += 1
+        self.desired = False
+        self.deadline = None
+        self.deadline_generation = None
+        if self.requested:
+            self.requested = False
+            return False
+        return None
+
+
 @dataclass
 class DeviceState:
     sequence: int
@@ -303,8 +368,7 @@ class Bridge:
         self.sequence = 0
         self.device_tx_active = False
         self.ptt_requested = False
-        self.ptt_release_deadline: float | None = None
-        self.allstar_keyed = False
+        self.ptt = PttHangController(args.ptt_hang)
         self.last_usrp_packet: float | None = None
         self.cos_active = False
         self.usrp_sequence = 0
@@ -390,6 +454,7 @@ class Bridge:
         )
         self.send_vendor(CMD_HOST_DESIRED_STATE, payload)
         self.ptt_requested = ptt
+        self.ptt.requested = ptt
         print(f"PTT {'ON' if ptt else 'OFF'} requested (sequence {self.sequence})")
 
     def handle_frame(self, frame: bytes) -> None:
@@ -434,12 +499,16 @@ class Bridge:
         self.state = state
         self.sequence = max(self.sequence, state.sequence)
         self.device_tx_active = bool(state.flags & DEVICE_TX_ACTIVE)
+        restart = self.ptt.set_actual(self.device_tx_active)
         self.cos_active = not bool(state.flags & DEVICE_SQUELCHED)
         if self.device_tx_active != old_tx:
             print(f"KV4P transmitter {'active' if self.device_tx_active else 'stopped'}")
         rx_active = self.cos_active and not self.device_tx_active
         if rx_active != self.rx_pacer.active:
             self.set_usrp_cos(rx_active)
+        if restart is True:
+            print("KV4P TX stopped while AllStar remains keyed; restarting PTT")
+            self.request_state(True)
 
     def handle_rx_audio(self, packet: bytes) -> None:
         try:
@@ -505,26 +574,22 @@ class Bridge:
                 if self.cos_active and not self.device_tx_active:
                     continue
 
-                if not self.allstar_keyed:
-                    self.allstar_keyed = True
-                    self.ptt_release_deadline = None
-                    self.tx_pcm.clear()
+                was_desired = self.ptt.desired
+                request, preserve_audio = self.ptt.set_desired(True, time.monotonic())
+                if not was_desired:
+                    if not preserve_audio:
+                        self.tx_pcm.clear()
                     print("AllStar requested TX")
+                if request is True:
                     self.request_state(True)
-
-                # We have received a real TX audio packet, so keep PTT alive.
-                self.ptt_release_deadline = None
 
                 if len(audio) == USRP_SAMPLES * 2:
                     self.tx_pcm.extend(audio)
 
-            elif self.allstar_keyed and self.ptt_release_deadline is None:
+            elif self.ptt.desired:
                 # No TX audio/keying packet. Start the PTT hang timer,
-                # but don't immediately release the KV4P. Latch the first
-                # deadline so subsequent unkeyed packets cannot extend it.
-                self.ptt_release_deadline = (
-                    time.monotonic() + self.args.ptt_hang
-                )
+                # but don't immediately release the KV4P.
+                self.ptt.set_desired(False, time.monotonic())
 
     def pump_tx(self) -> None:
         if not self.device_tx_active:
@@ -543,11 +608,11 @@ class Bridge:
 
     def unkey(self, reason: str) -> None:
         print(reason)
-        self.allstar_keyed = False
-        self.ptt_release_deadline = None
+        request = self.ptt.force_off()
         self.tx_pcm.clear()
         self.tx_pending.clear()
-        self.request_state(False)
+        if request is False:
+            self.request_state(False)
 
     def run(self) -> None:
         self.open()
@@ -558,17 +623,23 @@ class Bridge:
             self.receive_usrp()
             self.pump_tx()
             if (
-                self.allstar_keyed and self.last_usrp_packet is not None
+                self.ptt.desired and self.last_usrp_packet is not None
                 and time.monotonic() - self.last_usrp_packet > self.args.tx_timeout
             ):
                 self.unkey("USRP timeout; forcing PTT off")
 
             if (
-                self.allstar_keyed
-                and self.ptt_release_deadline is not None
-                and time.monotonic() >= self.ptt_release_deadline
+                not self.ptt.desired
+                and self.ptt.deadline is not None
+                and time.monotonic() >= self.ptt.deadline
             ):
-                self.unkey("AllStar released TX")
+                generation = self.ptt.deadline_generation
+                assert generation is not None
+                if self.ptt.expire(generation) is False:
+                    print("AllStar released TX")
+                    self.tx_pcm.clear()
+                    self.tx_pending.clear()
+                    self.request_state(False)
 
     def stop(self, *_args) -> None:
         self.running = False
