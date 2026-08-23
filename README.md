@@ -105,7 +105,8 @@ production.
 
 - Transmit is disabled when `--receive-only` is used.
 - Audio is sent only after KV4P reports `DEVICE_STATE_TX_ACTIVE`.
-- A 500 ms USRP watchdog unkeys if packets stop arriving.
+- A 1-second USRP watchdog unkeys if packets stop arriving by default; configure
+  it with `--tx-timeout`.
 - SIGINT/SIGTERM and normal shutdown explicitly request PTT off.
 - The ESP32 firmware retains its independent 200-second runaway-TX timeout.
 - Only USRP packets from `--allstar-host` are accepted.

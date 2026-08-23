@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import errno
 import signal
 import socket
 import struct
@@ -29,6 +30,9 @@ USRP_SAMPLES = 160  # 20 ms at 8 kHz
 USRP_FRAME_BYTES = USRP_SAMPLES * 2
 USRP_PERIOD = USRP_SAMPLES / 8_000
 USRP_RX_QUEUE_FRAMES = 10  # At most 200 ms of radio audio may wait for UDP.
+USRP_TX_QUEUE_FRAMES = 20  # At most 400 ms of AllStar audio may wait for KV4P.
+KV4P_TX_PENDING_FRAMES = 10  # At most 400 ms may wait for serial flow control.
+PTT_ACK_TIMEOUT = 1.0
 PROTO_MTU = 2_048
 
 FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
@@ -62,36 +66,48 @@ class Timespec(ctypes.Structure):
     _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
 
 
+_libc = ctypes.CDLL(None, use_errno=True)
+_clock_nanosleep = _libc.clock_nanosleep
+_clock_nanosleep.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(Timespec), ctypes.c_void_p
+]
+_clock_nanosleep.restype = ctypes.c_int
+
+
 def sleep_monotonic_until(deadline: float) -> None:
     """Sleep to an absolute CLOCK_MONOTONIC deadline."""
     seconds = int(deadline)
     target = Timespec(seconds, int((deadline - seconds) * 1_000_000_000))
-    libc = ctypes.CDLL(None, use_errno=True)
-    clock_nanosleep = libc.clock_nanosleep
-    clock_nanosleep.argtypes = [
-        ctypes.c_int, ctypes.c_int, ctypes.POINTER(Timespec), ctypes.c_void_p
-    ]
-    clock_nanosleep.restype = ctypes.c_int
     while True:
-        result = clock_nanosleep(time.CLOCK_MONOTONIC, 1, ctypes.byref(target), None)
+        result = _clock_nanosleep(
+            time.CLOCK_MONOTONIC, 1, ctypes.byref(target), None
+        )
         if result == 0:
             return
-        if result != 4:  # EINTR
+        if result != errno.EINTR:
             raise OSError(result, "clock_nanosleep")
 
 
 class UsrpRxPacer:
     """Clock radio RX packets onto USRP without ever sending a catch-up burst."""
 
-    def __init__(self, send, queue_frames: int = USRP_RX_QUEUE_FRAMES) -> None:
+    def __init__(
+        self, send, queue_frames: int = USRP_RX_QUEUE_FRAMES,
+        *, start_thread: bool = True,
+    ) -> None:
         self.send = send
         self.queue = deque(maxlen=queue_frames)
         self.condition = threading.Condition()
         self.active = False
         self.running = True
         self.dropped = 0
-        self.thread = threading.Thread(target=self._run, name="usrp-rx-pacer", daemon=True)
-        self.thread.start()
+        self.error: Exception | None = None
+        self.thread: threading.Thread | None = None
+        if start_thread:
+            self.thread = threading.Thread(
+                target=self._run, name="usrp-rx-pacer", daemon=True
+            )
+            self.thread.start()
 
     def enqueue(self, audio: bytes) -> None:
         if len(audio) != USRP_FRAME_BYTES:
@@ -116,6 +132,15 @@ class UsrpRxPacer:
             self.condition.notify_all()
 
     def _run(self) -> None:
+        try:
+            self._run_inner()
+        except Exception as error:
+            with self.condition:
+                self.error = error
+                self.running = False
+                self.condition.notify_all()
+
+    def _run_inner(self) -> None:
         deadline: float | None = None
         silence = bytes(USRP_FRAME_BYTES)
         while True:
@@ -152,20 +177,25 @@ class UsrpRxPacer:
         with self.condition:
             self.running = False
             self.condition.notify_all()
-        self.thread.join(timeout=1)
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+            if self.thread.is_alive() and self.error is None:
+                self.error = RuntimeError("USRP RX pacer did not stop")
 
 
 class PttHangController:
     """Keep USRP intent, requested PTT, and acknowledged radio TX separate."""
 
-    def __init__(self, hang_time: float) -> None:
+    def __init__(self, hang_time: float, ack_timeout: float = PTT_ACK_TIMEOUT) -> None:
         self.hang_time = hang_time
+        self.ack_timeout = ack_timeout
         self.desired = False
         self.requested = False
         self.actual = False
         self.generation = 0
         self.deadline: float | None = None
         self.deadline_generation: int | None = None
+        self.request_deadline: float | None = None
 
     def set_desired(self, active: bool, now: float) -> tuple[bool | None, bool]:
         """Return (new PTT request, preserve buffered audio)."""
@@ -179,7 +209,6 @@ class PttHangController:
             self.deadline = None
             self.deadline_generation = None
             if not self.requested or not self.actual:
-                self.requested = True
                 return True, preserve_audio
             return None, preserve_audio
 
@@ -196,17 +225,41 @@ class PttHangController:
         self.deadline = None
         self.deadline_generation = None
         if self.requested:
-            self.requested = False
             return False
         return None
+
+    def request_sent(self, active: bool, now: float | None = None) -> None:
+        """Record a desired-state command only after it was actually written."""
+        self.requested = active
+        self.request_deadline = (
+            (time.monotonic() if now is None else now) + self.ack_timeout
+        )
 
     def set_actual(self, active: bool) -> bool | None:
         """Re-key if a late device state stops TX while USRP still wants it."""
         was_active = self.actual
         self.actual = active
+        if active == self.requested:
+            self.request_deadline = None
         if was_active and not active and self.desired:
-            self.requested = True
             return True
+        if not was_active and active and not self.desired:
+            return False
+        return None
+
+    def reconcile(self, now: float | None = None) -> bool | None:
+        """Return the command needed to converge requested and actual state."""
+        if not self.desired and self.deadline is not None:
+            return None
+        if self.desired == self.actual:
+            return None
+        if self.requested != self.desired:
+            return self.desired
+        if (
+            self.request_deadline is not None
+            and (time.monotonic() if now is None else now) >= self.request_deadline
+        ):
+            return self.desired
         return None
 
     def force_off(self) -> bool | None:
@@ -214,8 +267,8 @@ class PttHangController:
         self.desired = False
         self.deadline = None
         self.deadline_generation = None
+        self.request_deadline = None
         if self.requested:
-            self.requested = False
             return False
         return None
 
@@ -375,7 +428,7 @@ class Bridge:
         self.rx_pcm = bytearray()
         self.tx_pcm = bytearray()
         self.window = 0
-        self.tx_pending: list[bytes] = []
+        self.tx_pending: deque[bytes] = deque()
         self.rx_filter = firwin(127, 3_400, fs=AUDIO_RATE)
         self.rx_filter_state = np.zeros(len(self.rx_filter) - 1)
         self.tx_filter = firwin(127, 3_400, fs=AUDIO_RATE)
@@ -383,7 +436,8 @@ class Bridge:
         self.wav: wave.Wave_write | None = None
         self.stats = dict(
             rx_opus=0, tx_opus=0, usrp_rx=0, usrp_tx=0,
-            rx_audio_dropped=0, decode_errors=0,
+            rx_audio_dropped=0, tx_audio_dropped=0,
+            tx_pending_dropped=0, decode_errors=0,
         )
         self.usrp_send_lock = threading.Lock()
         self.rx_pacer = UsrpRxPacer(self.send_usrp)
@@ -413,6 +467,9 @@ class Bridge:
         body = bytes([KISS_SETHARDWARE]) + VENDOR + bytes([command]) + payload
         frame = bytes([FEND]) + kiss_escape(body) + bytes([FEND])
         if command == CMD_AUDIO and self.window and len(frame) > self.window:
+            if len(self.tx_pending) >= KV4P_TX_PENDING_FRAMES:
+                self.tx_pending.popleft()
+                self.stats["tx_pending_dropped"] += 1
             self.tx_pending.append(frame)
             return
         self.ser.write(frame)
@@ -423,7 +480,7 @@ class Bridge:
         if not self.ser:
             return
         while self.tx_pending and (not self.window or len(self.tx_pending[0]) <= self.window):
-            frame = self.tx_pending.pop(0)
+            frame = self.tx_pending.popleft()
             self.ser.write(frame)
             if self.window:
                 self.window -= len(frame)
@@ -442,9 +499,9 @@ class Bridge:
 
         return flags
 
-    def request_state(self, ptt: bool) -> None:
+    def request_state(self, ptt: bool) -> bool:
         if not self.state or (ptt and self.args.receive_only):
-            return
+            return False
         self.sequence += 1
         payload = DESIRED.pack(
             self.sequence, self.state.memory_id, self.desired_flags(ptt),
@@ -454,8 +511,9 @@ class Bridge:
         )
         self.send_vendor(CMD_HOST_DESIRED_STATE, payload)
         self.ptt_requested = ptt
-        self.ptt.requested = ptt
+        self.ptt.request_sent(ptt, time.monotonic())
         print(f"PTT {'ON' if ptt else 'OFF'} requested (sequence {self.sequence})")
+        return True
 
     def handle_frame(self, frame: bytes) -> None:
         if len(frame) < 7 or frame[0] != KISS_SETHARDWARE or frame[1:6] != VENDOR:
@@ -499,16 +557,21 @@ class Bridge:
         self.state = state
         self.sequence = max(self.sequence, state.sequence)
         self.device_tx_active = bool(state.flags & DEVICE_TX_ACTIVE)
-        restart = self.ptt.set_actual(self.device_tx_active)
+        correction = self.ptt.set_actual(self.device_tx_active)
         self.cos_active = not bool(state.flags & DEVICE_SQUELCHED)
         if self.device_tx_active != old_tx:
             print(f"KV4P transmitter {'active' if self.device_tx_active else 'stopped'}")
         rx_active = self.cos_active and not self.device_tx_active
         if rx_active != self.rx_pacer.active:
             self.set_usrp_cos(rx_active)
-        if restart is True:
+        if correction is None:
+            correction = self.ptt.reconcile(time.monotonic())
+        if correction is True:
             print("KV4P TX stopped while AllStar remains keyed; restarting PTT")
             self.request_state(True)
+        elif correction is False:
+            print("KV4P TX active while AllStar is unkeyed; forcing PTT off")
+            self.request_state(False)
 
     def handle_rx_audio(self, packet: bytes) -> None:
         try:
@@ -549,6 +612,19 @@ class Bridge:
         else:
             print("RF COS closed")
 
+    def queue_tx_audio(self, audio: bytes) -> None:
+        """Queue fresh AllStar audio while bounding latency and memory use."""
+        if len(audio) != USRP_FRAME_BYTES:
+            return
+        self.tx_pcm.extend(audio)
+        maximum = USRP_FRAME_BYTES * USRP_TX_QUEUE_FRAMES
+        if len(self.tx_pcm) > maximum:
+            excess_frames = (
+                len(self.tx_pcm) - maximum + USRP_FRAME_BYTES - 1
+            ) // USRP_FRAME_BYTES
+            del self.tx_pcm[:excess_frames * USRP_FRAME_BYTES]
+            self.stats["tx_audio_dropped"] += excess_frames
+
     def receive_usrp(self) -> None:
         while True:
             try:
@@ -570,6 +646,8 @@ class Bridge:
             audio = packet[USRP_HEADER.size:]
 
             if keyup:
+                if self.args.receive_only:
+                    continue
                 # The radio is half duplex. RF has priority once COS opens.
                 if self.cos_active and not self.device_tx_active:
                     continue
@@ -583,8 +661,7 @@ class Bridge:
                 if request is True:
                     self.request_state(True)
 
-                if len(audio) == USRP_SAMPLES * 2:
-                    self.tx_pcm.extend(audio)
+                self.queue_tx_audio(audio)
 
             elif self.ptt.desired:
                 # No TX audio/keying packet. Start the PTT hang timer,
@@ -622,6 +699,13 @@ class Bridge:
                 self.handle_frame(frame)
             self.receive_usrp()
             self.pump_tx()
+            correction = self.ptt.reconcile(time.monotonic())
+            if correction is not None:
+                self.request_state(correction)
+            if self.rx_pacer.error is not None:
+                raise RuntimeError(
+                    f"USRP RX pacer failed: {self.rx_pacer.error}"
+                ) from self.rx_pacer.error
             if (
                 self.ptt.desired and self.last_usrp_packet is not None
                 and time.monotonic() - self.last_usrp_packet > self.args.tx_timeout
@@ -650,7 +734,11 @@ class Bridge:
                 self.request_state(False)
                 time.sleep(0.25)
         finally:
-            self.rx_pacer.set_active(False)
+            try:
+                self.rx_pacer.set_active(False)
+            except Exception as error:
+                if self.rx_pacer.error is None:
+                    self.rx_pacer.error = error
             self.rx_pacer.close()
             self.stats["rx_audio_dropped"] = self.rx_pacer.dropped
             if self.wav:
