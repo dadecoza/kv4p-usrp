@@ -23,6 +23,49 @@ RF ↔ SA818 ↔ ESP32/KV4P ↔ USB serial ↔ kv4p_usrp.py
 - Python packages in `requirements.txt`
 - AllStarLink with `chan_usrp.so`
 
+## Quick install on an AllStarLink node
+
+On an ASL3/Debian node, connect the KV4P and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dadecoza/kv4p-usrp/main/install.sh | sudo bash
+```
+
+The installer detects likely serial devices, asks for the RX and TX
+frequencies, installs the Python dependencies in a dedicated virtual
+environment, and creates a hardened `kv4p-usrp.service`. It defaults the first
+start to receive-only so that RF receive can be verified before transmission is
+enabled.
+
+Then ensure the appropriate node section in `/etc/asterisk/rpt.conf` contains:
+
+```ini
+rxchannel = USRP/127.0.0.1:34001:32001
+```
+
+Follow the service log while testing:
+
+```bash
+sudo journalctl -u kv4p-usrp -f
+```
+
+To enable transmit or change radio settings, rerun the installer with
+`--reconfigure`. A fully non-interactive install is also supported:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dadecoza/kv4p-usrp/main/install.sh \
+  | sudo bash -s -- \
+      --device /dev/serial/by-id/<YOUR_KV4P_DEVICE> \
+      --rx-frequency <RX_MHZ> \
+      --tx-frequency <TX_MHZ> \
+      --allow-transmit
+```
+
+Running the one-line installer again updates an existing installation while
+preserving `/etc/default/kv4p-usrp`. Other useful installer modes are
+`--no-start`, `--reconfigure`, and `--uninstall` (which preserves the
+configuration file).
+
 On Debian/Ubuntu:
 
 ```bash

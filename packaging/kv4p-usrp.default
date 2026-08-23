@@ -1,0 +1,3 @@
+# Command-line options passed to kv4p_usrp.py by kv4p-usrp.service.
+# RX and TX frequencies are required. Prefer a stable /dev/serial/by-id path.
+KV4P_ARGS="--device /dev/ttyUSB0 --rx-frequency 145.625 --tx-frequency 145.025 --squelch 4 --receive-only"
