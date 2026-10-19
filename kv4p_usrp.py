@@ -10,6 +10,7 @@ import argparse
 import ctypes
 import ctypes.util
 import errno
+import math
 import signal
 import socket
 import struct
@@ -505,7 +506,9 @@ class Bridge:
         self.sequence += 1
         payload = DESIRED.pack(
             self.sequence, self.state.memory_id, self.desired_flags(ptt),
-            self.state.bandwidth, self.args.tx_frequency,
+            (self.state.bandwidth if self.args.bandwidth == "keep"
+             else {"wide": 1, "narrow": 0}[self.args.bandwidth]),
+            self.args.tx_frequency,
             self.args.rx_frequency,
             self.state.tx_ctcss, self.args.squelch, self.state.rx_ctcss,
         )
@@ -587,7 +590,9 @@ class Bridge:
         filtered, self.rx_filter_state = lfilter(
             self.rx_filter, [1.0], samples, zi=self.rx_filter_state
         )
-        samples_8k = np.clip(np.rint(filtered[::6]), -32768, 32767).astype("<i2")
+        samples_8k = np.clip(
+            np.rint(filtered[::6] * self.args.rx_gain), -32768, 32767
+        ).astype("<i2")
         if self.cos_active and not self.device_tx_active:
             self.rx_pcm.extend(samples_8k.tobytes())
             while len(self.rx_pcm) >= USRP_FRAME_BYTES:
@@ -750,6 +755,13 @@ class Bridge:
             print("Statistics: " + " ".join(f"{k}={v}" for k, v in self.stats.items()))
 
 
+def positive_finite_gain(value: str) -> float:
+    gain = float(value)
+    if not math.isfinite(gain) or gain <= 0:
+        raise argparse.ArgumentTypeError("RX gain must be a finite number greater than zero")
+    return gain
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="/dev/ttyUSB1", help="KV4P serial device")
@@ -762,6 +774,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allstar-port", type=int, default=32_001)
     parser.add_argument("--usrp-bind", default="0.0.0.0")
     parser.add_argument("--usrp-local-port", type=int, default=34_001)
+    parser.add_argument(
+        "--rx-gain", type=positive_finite_gain, default=1.0,
+        help="RF-to-AllStar audio multiplier (default: 1.0; 2.0 is +6 dB)",
+    )
+    parser.add_argument(
+        "--bandwidth", choices=("keep", "wide", "narrow"), default="keep",
+        help="radio bandwidth: wide (25 kHz), narrow (12.5 kHz), or keep device setting (default)",
+    )
     parser.add_argument("--squelch", type=int, choices=range(0, 9), default=4)
     parser.add_argument(
         "--rx-frequency", type=float, required=True,

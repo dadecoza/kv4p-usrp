@@ -225,5 +225,65 @@ class BridgeQueueTest(unittest.TestCase):
         self.assertEqual(len(bridge.tx_pending), KV4P_TX_PENDING_FRAMES)
         self.assertEqual(bridge.stats["tx_pending_dropped"], 2)
 
+
+
+class ReceiveSettingsTest(unittest.TestCase):
+    def test_gain_scales_audio_and_saturates_without_wrapping(self):
+        import io
+        import numpy as np
+        for gain, expected in ((1.0, [20000, -20000]), (2.0, [32767, -32768]),
+                               (0.5, [10000, -10000])):
+            raw = np.tile([20000, -20000], 160).astype("<i2").repeat(6).tobytes()
+            frames = []
+            recording = io.BytesIO()
+            bridge = SimpleNamespace(
+                codec=SimpleNamespace(decode=lambda _: raw),
+                stats={"rx_opus": 0}, wav=SimpleNamespace(writeframesraw=recording.write),
+                rx_filter=[1.0], rx_filter_state=[], cos_active=True,
+                device_tx_active=False, rx_pcm=bytearray(),
+                rx_pacer=SimpleNamespace(enqueue=frames.append),
+                args=SimpleNamespace(rx_gain=gain),
+            )
+            Bridge.handle_rx_audio(bridge, b"encoded")
+            samples = np.frombuffer(b"".join(frames), dtype="<i2")
+            np.testing.assert_array_equal(samples, np.tile(expected, 160))
+            self.assertEqual(recording.getvalue(), raw)
+
+    def test_bandwidth_is_encoded_in_every_state_request(self):
+        from kv4p_usrp import DESIRED
+        for setting, inherited, expected in (
+            ("wide", 0, 1), ("narrow", 1, 0), ("keep", 0, 0), ("keep", 1, 1)
+        ):
+            packets = []
+            bridge = SimpleNamespace(
+                args=SimpleNamespace(bandwidth=setting, receive_only=False,
+                                     tx_frequency=145.5, rx_frequency=145.5, squelch=4),
+                state=SimpleNamespace(memory_id=-1, bandwidth=inherited,
+                                      tx_ctcss=0, rx_ctcss=0),
+                sequence=0, desired_flags=lambda ptt: 0,
+                send_vendor=lambda command, payload: packets.append(payload),
+                ptt=PttHangController(0.4),
+            )
+            for keyed in (False, True, False):
+                self.assertTrue(Bridge.request_state(bridge, keyed))
+                self.assertEqual(DESIRED.unpack(packets[-1])[3], expected)
+
+    def test_argument_defaults_and_validation(self):
+        from unittest.mock import patch
+        from kv4p_usrp import parse_args
+        import contextlib
+        import io
+        base = ["bridge", "--rx-frequency", "145.5", "--tx-frequency", "145.5"]
+        with patch("sys.argv", base):
+            args = parse_args()
+            self.assertEqual(args.rx_gain, 1.0)
+            self.assertEqual(args.bandwidth, "keep")
+        for extra in (["--rx-gain", "0"], ["--rx-gain", "-1"],
+                      ["--rx-gain", "nan"], ["--rx-gain", "inf"],
+                      ["--bandwidth", "invalid"]):
+            with patch("sys.argv", base + extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args()
+
 if __name__ == "__main__":
     unittest.main()
