@@ -12,6 +12,8 @@ RX_FREQUENCY=""
 TX_FREQUENCY=""
 SQUELCH="4"
 POWER="high"
+RX_GAIN="1.0"
+BANDWIDTH="keep"
 PTT_HANG="0.40"
 ALLSTAR_HOST="127.0.0.1"
 RECEIVE_ONLY=""
@@ -32,6 +34,8 @@ Usage: sudo bash install.sh [options]
   --rx-frequency MHz     Radio receive frequency (required for new installs)
   --tx-frequency MHz     Radio transmit frequency (required for new installs)
   --squelch 0..8         Squelch level (default: 4)
+  --rx-gain FACTOR       RF-to-AllStar audio multiplier (default: 1.0)
+  --bandwidth MODE       wide, narrow, or keep (default: keep device setting)
   --power high|low       Transmit power (default: high)
   --ptt-hang SECONDS     PTT hang time (default: 0.40)
   --allstar-host HOST    AllStar host (default: 127.0.0.1)
@@ -56,6 +60,8 @@ while [[ $# -gt 0 ]]; do
         --rx-frequency) need_value "$@"; RX_FREQUENCY=$2; CONFIG_REQUESTED=1; shift 2 ;;
         --tx-frequency) need_value "$@"; TX_FREQUENCY=$2; CONFIG_REQUESTED=1; shift 2 ;;
         --squelch) need_value "$@"; SQUELCH=$2; CONFIG_REQUESTED=1; shift 2 ;;
+        --rx-gain) need_value "$@"; RX_GAIN=$2; CONFIG_REQUESTED=1; shift 2 ;;
+        --bandwidth) need_value "$@"; BANDWIDTH=$2; CONFIG_REQUESTED=1; shift 2 ;;
         --power) need_value "$@"; POWER=$2; CONFIG_REQUESTED=1; shift 2 ;;
         --ptt-hang) need_value "$@"; PTT_HANG=$2; CONFIG_REQUESTED=1; shift 2 ;;
         --allstar-host) need_value "$@"; ALLSTAR_HOST=$2; CONFIG_REQUESTED=1; shift 2 ;;
@@ -157,6 +163,12 @@ if [[ $write_config -eq 1 ]]; then
     [[ -n $TX_FREQUENCY ]] || TX_FREQUENCY=$(prompt "TX frequency in MHz")
     validate_number "RX frequency" "$RX_FREQUENCY"
     validate_number "TX frequency" "$TX_FREQUENCY"
+    validate_number "RX gain" "$RX_GAIN"
+    "$INSTALL_DIR/.venv/bin/python" -c \
+        'import math, sys; g = float(sys.argv[1]); sys.exit(not (math.isfinite(g) and g > 0))' \
+        "$RX_GAIN" || die "RX gain must be a finite number greater than zero"
+    [[ $BANDWIDTH == keep || $BANDWIDTH == wide || $BANDWIDTH == narrow ]] || \
+        die "bandwidth must be keep, wide, or narrow"
     validate_number "PTT hang" "$PTT_HANG"
     [[ $SQUELCH =~ ^[0-8]$ ]] || die "squelch must be from 0 to 8"
     [[ $POWER == high || $POWER == low ]] || die "power must be high or low"
@@ -167,7 +179,7 @@ if [[ $write_config -eq 1 ]]; then
         [[ $answer =~ ^[Nn]$ ]] && RECEIVE_ONLY=0 || RECEIVE_ONLY=1
     fi
 
-    args="--device $DEVICE --rx-frequency $RX_FREQUENCY --tx-frequency $TX_FREQUENCY --squelch $SQUELCH --power $POWER --ptt-hang $PTT_HANG --allstar-host $ALLSTAR_HOST"
+    args="--device $DEVICE --rx-frequency $RX_FREQUENCY --tx-frequency $TX_FREQUENCY --squelch $SQUELCH --rx-gain $RX_GAIN --bandwidth $BANDWIDTH --power $POWER --ptt-hang $PTT_HANG --allstar-host $ALLSTAR_HOST"
     [[ $RECEIVE_ONLY -eq 1 ]] && args+=" --receive-only"
     umask 027
     printf '# Managed by the kv4p-usrp installer. Run install.sh --reconfigure to replace.\nKV4P_ARGS="%s"\n' \

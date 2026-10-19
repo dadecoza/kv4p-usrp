@@ -144,6 +144,31 @@ frequency is legal for the operator, country, licence class, or local band
 plan. Use a persistent `/dev/serial/by-id/...` or udev-created device name in
 production.
 
+## Receive gain and bandwidth
+
+Use `--rx-gain 2.0 --bandwidth wide` to boost RF-to-AllStar audio by
+approximately 6 dB and explicitly select wide FM. Gain defaults to `1.0`
+(unchanged); `4.0` is approximately +12 dB. Use normal speech with an audio
+test node when adjusting. Excess gain raises noise and clips loud speech at
+the signed 16-bit limits. AllStar-to-RF audio is unaffected.
+The optional `--record` WAV remains the decoded RX audio before bridge gain.
+
+Bandwidth accepts `wide` (25 kHz), `narrow` (12.5 kHz), or `keep` (default:
+preserve the device-reported setting). The selected bandwidth applies to both
+radio receive and transmit. Match the other radio and channel requirements.
+
+For an installed service, append these options inside the existing
+`KV4P_ARGS="..."` line in `/etc/default/kv4p-usrp`, then restart:
+
+```bash
+sudo systemctl restart kv4p-usrp
+```
+
+The installer also accepts `--rx-gain` and `--bandwidth` when creating or
+replacing configuration. Supplying installer configuration options replaces
+the configuration, so provide the other station settings too. A plain update
+preserves the existing configuration, including any manually added options.
+
 ## Safety
 
 - Transmit is disabled when `--receive-only` is used.
